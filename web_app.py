@@ -26,9 +26,30 @@ NEWS_CACHE_PATH = DATA_DIR / "news_cache.json"
 SCAN_STATE_PATH = DATA_DIR / "last_scan.json"
 FILLS_CSV_PATH = DATA_DIR / "fills.csv"
 AUTO_STATE_PATH = DATA_DIR / "auto_trader.json"
+WATCHLIST_PATH = DATA_DIR / "watchlist.json"
+RECOMMENDATIONS_PATH = DATA_DIR / "recommendations.json"
 DEFAULT_CASH = 100000.0
 MAX_ORDER_NOTIONAL = 10000.0
 NEWS_CACHE_TTL_SECONDS = 900
+DEFAULT_WATCHLIST = ["AAPL", "MSFT", "NVDA", "TSLA"]
+RECOMMEND_UNIVERSE = [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "GOOGL",
+    "AMZN",
+    "META",
+    "TSLA",
+    "AMD",
+    "AVGO",
+    "NFLX",
+    "JPM",
+    "V",
+    "MA",
+    "COST",
+    "LLY",
+    "UNH",
+]
 NEWS_FEEDS = [
     "https://finance.yahoo.com/news/rssindex",
     "https://www.marketwatch.com/rss/topstories",
@@ -84,6 +105,49 @@ def write_json(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         json.dump(value, file, indent=2, ensure_ascii=False)
+
+
+def normalize_symbol(symbol: str) -> str:
+    return "".join(char for char in symbol.upper().strip() if char.isalnum() or char in ".-")[:12]
+
+
+def load_watchlist() -> list[str]:
+    value = read_json(WATCHLIST_PATH, {"symbols": DEFAULT_WATCHLIST})
+    symbols = value.get("symbols", DEFAULT_WATCHLIST) if isinstance(value, dict) else value
+    normalized = []
+    for symbol in symbols:
+        clean = normalize_symbol(str(symbol))
+        if clean and clean not in normalized:
+            normalized.append(clean)
+    return normalized or DEFAULT_WATCHLIST.copy()
+
+
+def save_watchlist(symbols: list[str]) -> None:
+    normalized = []
+    for symbol in symbols:
+        clean = normalize_symbol(symbol)
+        if clean and clean not in normalized:
+            normalized.append(clean)
+    write_json(WATCHLIST_PATH, {"symbols": normalized, "updated_at": now_iso()})
+
+
+def add_to_watchlist(symbol: str) -> str:
+    clean = normalize_symbol(symbol)
+    if not clean:
+        return "股票代碼無效。"
+    symbols = load_watchlist()
+    if clean in symbols:
+        return f"{clean} 已在 watchlist。"
+    symbols.append(clean)
+    save_watchlist(symbols)
+    return f"已加入 watchlist：{clean}"
+
+
+def remove_from_watchlist(symbol: str) -> str:
+    clean = normalize_symbol(symbol)
+    symbols = [item for item in load_watchlist() if item != clean]
+    save_watchlist(symbols)
+    return f"已從 watchlist 移除：{clean}"
 
 
 def load_account() -> dict:
@@ -215,6 +279,8 @@ def analyze_market(market: MarketData, account: dict) -> dict:
     short_latest = short[-1] or latest
     long_latest = long[-1] or latest
     momentum = ((prices[-1] - prices[-6]) / prices[-6]) * 100 if len(prices) >= 6 else 0
+    trend_pct = ((latest - long_latest) / long_latest) * 100 if long_latest else 0
+    short_trend_pct = ((latest - short_latest) / short_latest) * 100 if short_latest else 0
     position = int(account.get("positions", {}).get(market.symbol, 0))
 
     signal = "HOLD"
@@ -226,12 +292,23 @@ def analyze_market(market: MarketData, account: dict) -> dict:
         signal = "SELL"
         reason = "持倉中，價格跌破50日均線或5日動能轉弱"
 
+    score = round((momentum * 2.0) + trend_pct + (short_trend_pct * 0.5), 2)
+    if signal == "BUY":
+        score += 12
+    elif signal == "SELL":
+        score -= 20
+    if position > 0 and signal != "SELL":
+        score += 2
+
     return {
         "symbol": market.symbol,
         "latest": latest,
         "short_ma": short_latest,
         "long_ma": long_latest,
         "momentum": momentum,
+        "trend_pct": trend_pct,
+        "short_trend_pct": short_trend_pct,
+        "score": round(score, 2),
         "signal": signal,
         "reason": reason,
         "source": market.source,
@@ -277,8 +354,54 @@ def create_order_from_scan(symbol: str, quantity: int) -> tuple[str, dict]:
     return f"已建立待確認訂單：{order.symbol} {order.side} x {order.quantity}，尚未成交。", analysis
 
 
+def recommendation_universe() -> list[str]:
+    symbols = []
+    for symbol in load_watchlist() + RECOMMEND_UNIVERSE:
+        clean = normalize_symbol(symbol)
+        if clean and clean not in symbols:
+            symbols.append(clean)
+    return symbols
+
+
+def refresh_recommendations() -> list[dict]:
+    account = load_account()
+    watchlist = set(load_watchlist())
+    rows = []
+    for symbol in recommendation_universe():
+        market = fetch_market_data(symbol)
+        analysis = analyze_market(market, account)
+        rows.append(
+            {
+                "symbol": symbol,
+                "latest": analysis["latest"],
+                "score": analysis["score"],
+                "signal": analysis["signal"],
+                "momentum": analysis["momentum"],
+                "trend_pct": analysis["trend_pct"],
+                "reason": analysis["reason"],
+                "watched": symbol in watchlist,
+                "source": analysis["source"],
+                "fetched_at": analysis["fetched_at"],
+                "error": analysis["error"],
+            }
+        )
+    rows.sort(key=lambda row: row["score"], reverse=True)
+    write_json(RECOMMENDATIONS_PATH, {"updated_at": now_iso(), "items": rows})
+    return rows
+
+
+def load_recommendations() -> dict:
+    cached = read_json(RECOMMENDATIONS_PATH, {})
+    if cached.get("items"):
+        watchlist = set(load_watchlist())
+        for item in cached["items"]:
+            item["watched"] = item.get("symbol") in watchlist
+        return cached
+    return {"updated_at": now_iso(), "items": refresh_recommendations()}
+
+
 def auto_scan_watchlist(watchlist: str) -> str:
-    symbols = [item.strip().upper() for item in watchlist.split(",") if item.strip()]
+    symbols = [normalize_symbol(item) for item in watchlist.split(",") if normalize_symbol(item)]
     if not symbols:
         return "Watchlist 為空。"
     messages = []
@@ -307,9 +430,10 @@ def auto_scan_watchlist(watchlist: str) -> str:
 
 
 def load_auto_state() -> dict:
-    state = read_json(AUTO_STATE_PATH, {"enabled": False, "watchlist": "AAPL,MSFT,NVDA,TSLA", "interval": 300, "last_run": "", "last_message": ""})
+    default_watchlist = ",".join(load_watchlist())
+    state = read_json(AUTO_STATE_PATH, {"enabled": False, "watchlist": default_watchlist, "interval": 300, "last_run": "", "last_message": ""})
     state.setdefault("enabled", False)
-    state.setdefault("watchlist", "AAPL,MSFT,NVDA,TSLA")
+    state.setdefault("watchlist", default_watchlist)
     state.setdefault("interval", 300)
     state.setdefault("last_run", "")
     state.setdefault("last_message", "")
@@ -457,11 +581,57 @@ def render_orders(orders: list[Order]) -> str:
     return "".join(rows) or "<tr><td colspan='8'>暫無訂單</td></tr>"
 
 
+def render_watchlist(symbols: list[str]) -> str:
+    rows = []
+    for symbol in symbols:
+        rows.append(
+            "<tr>"
+            f"<td><strong>{html.escape(symbol)}</strong></td>"
+            "<td>"
+            f"<form method='post' action='/scan' class='inline'><input type='hidden' name='symbol' value='{html.escape(symbol)}'><input type='hidden' name='quantity' value='10'><button>掃描</button></form>"
+            f"<form method='post' action='/watchlist-remove' class='inline'><input type='hidden' name='symbol' value='{html.escape(symbol)}'><button class='secondary'>移除</button></form>"
+            "</td>"
+            "</tr>"
+        )
+    return "".join(rows) or "<tr><td colspan='2'>暫無 watchlist</td></tr>"
+
+
+def render_recommendations(recommendations: list[dict]) -> str:
+    rows = []
+    for index, item in enumerate(recommendations[:12], start=1):
+        badge = "已關注" if item.get("watched") else "加入"
+        add_action = ""
+        if not item.get("watched"):
+            add_action = (
+                f"<form method='post' action='/watchlist-add' class='inline'>"
+                f"<input type='hidden' name='symbol' value='{html.escape(item['symbol'])}'>"
+                f"<button>{badge}</button></form>"
+            )
+        else:
+            add_action = f"<span class='status'>{badge}</span>"
+        rows.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td><strong>{html.escape(item['symbol'])}</strong></td>"
+            f"<td>{item['score']:,.2f}</td>"
+            f"<td>{item['signal']}</td>"
+            f"<td>${item['latest']:,.2f}</td>"
+            f"<td>{item['momentum']:.2f}%</td>"
+            f"<td>{item['trend_pct']:.2f}%</td>"
+            f"<td>{html.escape(item['reason'])}<small>{html.escape(item.get('source', ''))}</small></td>"
+            f"<td>{add_action}</td>"
+            "</tr>"
+        )
+    return "".join(rows) or "<tr><td colspan='9'>暫無推薦</td></tr>"
+
+
 def render_page(message: str = "") -> bytes:
     account = load_account()
     orders = load_orders()
     scan = latest_scan()
     auto_state = load_auto_state()
+    watchlist = load_watchlist()
+    recommendations = load_recommendations()
     analysis = scan["analysis"]
     market = scan["market"]
     news = fetch_news()
@@ -502,6 +672,7 @@ def render_page(message: str = "") -> bytes:
         table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
         th, td {{ border-bottom: 1px solid #e6e9ee; padding: 9px; text-align: left; vertical-align: top; }}
         input, button {{ padding: 9px 11px; border-radius: 6px; border: 1px solid #b8c0cc; font-size: 14px; }}
+        input[type="hidden"] {{ display: none; }}
         button {{ background: #18745a; color: white; border: 0; cursor: pointer; }}
         button.secondary {{ background: #667085; }}
         .inline {{ display: inline; margin-right: 6px; }}
@@ -511,6 +682,7 @@ def render_page(message: str = "") -> bytes:
         .notice {{ color: #18745a; font-weight: 700; }}
         .warn {{ color: #9a3412; background: #fff7ed; padding: 8px; border-radius: 6px; }}
         .status {{ font-weight: 700; }}
+        .wide {{ grid-column: 1 / -1; }}
         small {{ display: block; color: #64748b; margin-top: 4px; }}
         svg {{ width: 100%; height: 170px; background: #fbfdff; border: 1px solid #e2e8f0; border-radius: 8px; }}
         ul {{ padding-left: 18px; }}
@@ -553,15 +725,30 @@ def render_page(message: str = "") -> bytes:
         </section>
 
         <section>
+          <h2>Watchlist</h2>
+          <form method="post" action="/watchlist-add">
+            <input name="symbol" placeholder="輸入股票代碼，例如 AAPL">
+            <button>加入 Watchlist</button>
+          </form>
+          <table><thead><tr><th>股票</th><th>操作</th></tr></thead><tbody>{render_watchlist(watchlist)}</tbody></table>
+
+          <h2>Recommend List</h2>
+          <form method="post" action="/recommend-refresh"><button>刷新推薦排行</button></form>
+          <small>更新：{html.escape(recommendations.get('updated_at', '-'))}。分數越高越推薦，根據動能、均線趨勢、策略訊號排序。</small>
+          <table>
+            <thead><tr><th>#</th><th>股票</th><th>分數</th><th>訊號</th><th>價格</th><th>5日動能</th><th>對50MA</th><th>原因</th><th>Watch</th></tr></thead>
+            <tbody>{render_recommendations(recommendations.get('items', []))}</tbody>
+          </table>
+
           <h2>自動掃描</h2>
           <form method="post" action="/auto-scan">
-            <input name="watchlist" value="{html.escape(auto_state['watchlist'])}">
+            <input type="hidden" name="watchlist" value="{html.escape(','.join(watchlist))}">
             <button>掃描 Watchlist</button>
           </form>
           <small>自動掃描只建立待確認訂單，不會直接成交。</small>
           <h3>自動監控</h3>
           <form method="post" action="/auto-start" class="inline">
-            <input name="watchlist" value="{html.escape(auto_state['watchlist'])}">
+            <input type="hidden" name="watchlist" value="{html.escape(','.join(watchlist))}">
             <input name="interval" type="number" min="60" value="{int(auto_state['interval'])}">
             <button>啟動</button>
           </form>
@@ -600,11 +787,23 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(render_page(message))
             return
         if self.path == "/auto-scan":
-            message = auto_scan_watchlist(data.get("watchlist", ["AAPL,MSFT,NVDA"])[0])
+            message = auto_scan_watchlist(data.get("watchlist", [",".join(load_watchlist())])[0])
             self.respond(render_page(message))
             return
+        if self.path == "/watchlist-add":
+            message = add_to_watchlist(data.get("symbol", [""])[0])
+            self.respond(render_page(message))
+            return
+        if self.path == "/watchlist-remove":
+            message = remove_from_watchlist(data.get("symbol", [""])[0])
+            self.respond(render_page(message))
+            return
+        if self.path == "/recommend-refresh":
+            refresh_recommendations()
+            self.respond(render_page("推薦排行已刷新。"))
+            return
         if self.path == "/auto-start":
-            watchlist = data.get("watchlist", ["AAPL,MSFT,NVDA,TSLA"])[0]
+            watchlist = data.get("watchlist", [",".join(load_watchlist())])[0]
             interval = int(data.get("interval", ["300"])[0] or "300")
             self.respond(render_page(set_auto_trader(True, watchlist, interval)))
             return

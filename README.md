@@ -42,6 +42,7 @@ http://127.0.0.1:8502
 - Watchlist：用戶可自行新增、移除、掃描股票
 - Recommend List：系統按策略分數自動排序推薦股票
 - Watchlist 自動監控，定時生成待確認訂單
+- LLM 股票分析助手：可詢問特定股票，系統用趨勢跟隨、動量、均值回歸、多因子、風控框架判斷買入/持有/賣出
 - 用戶確認後才 paper trading 成交
 - 拒絕訂單
 - Paper cash、持倉、成交記錄
@@ -52,6 +53,18 @@ Streamlit 版本需要安裝依賴：
 ```bash
 streamlit run app.py
 ```
+
+### 啟用 LLM
+
+不設 API key 時，LLM 股票分析助手會使用本地多理論分析。若要接入 OpenAI：
+
+```bash
+export OPENAI_API_KEY="你的 OpenAI API key"
+export OPENAI_MODEL="gpt-4o-mini"
+PORT=8502 python3 web_app.py
+```
+
+LLM 只會基於系統抓到的行情和本地理論判斷生成分析，不會直接下單。
 
 ## 安全設計
 

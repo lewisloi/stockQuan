@@ -28,6 +28,7 @@ FILLS_CSV_PATH = DATA_DIR / "fills.csv"
 AUTO_STATE_PATH = DATA_DIR / "auto_trader.json"
 WATCHLIST_PATH = DATA_DIR / "watchlist.json"
 RECOMMENDATIONS_PATH = DATA_DIR / "recommendations.json"
+LLM_STATE_PATH = DATA_DIR / "last_llm_answer.json"
 DEFAULT_CASH = 100000.0
 MAX_ORDER_NOTIONAL = 10000.0
 NEWS_CACHE_TTL_SECONDS = 900
@@ -54,6 +55,8 @@ NEWS_FEEDS = [
     "https://finance.yahoo.com/news/rssindex",
     "https://www.marketwatch.com/rss/topstories",
 ]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 AUTO_STATE_LOCK = threading.Lock()
 
 
@@ -400,6 +403,167 @@ def load_recommendations() -> dict:
     return {"updated_at": now_iso(), "items": refresh_recommendations()}
 
 
+def build_theory_judgements(analysis: dict) -> list[dict[str, str]]:
+    latest = analysis["latest"]
+    short_ma = analysis["short_ma"]
+    long_ma = analysis["long_ma"]
+    momentum = analysis["momentum"]
+    trend_pct = analysis["trend_pct"]
+    score = analysis["score"]
+    judgements = []
+
+    trend_action = "BUY" if latest > long_ma and latest > short_ma else "SELL" if latest < long_ma else "HOLD"
+    judgements.append(
+        {
+            "theory": "趨勢跟隨",
+            "action": trend_action,
+            "reason": f"現價相對50日均線 {trend_pct:.2f}%，現價 {'高於' if latest > long_ma else '低於'} 50日均線。",
+        }
+    )
+
+    momentum_action = "BUY" if momentum > 2 else "SELL" if momentum < -2 else "HOLD"
+    judgements.append(
+        {
+            "theory": "動量理論",
+            "action": momentum_action,
+            "reason": f"5日動能為 {momentum:.2f}%，{'動能偏強' if momentum > 2 else '動能偏弱' if momentum < -2 else '動能不明顯'}。",
+        }
+    )
+
+    distance_to_short = ((latest - short_ma) / short_ma) * 100 if short_ma else 0
+    mean_action = "SELL" if distance_to_short > 8 else "BUY" if distance_to_short < -8 else "HOLD"
+    judgements.append(
+        {
+            "theory": "均值回歸",
+            "action": mean_action,
+            "reason": f"現價相對20日均線 {distance_to_short:.2f}%，偏離過大時傾向等待回歸。",
+        }
+    )
+
+    score_action = "BUY" if score >= 15 else "SELL" if score <= -8 else "HOLD"
+    judgements.append(
+        {
+            "theory": "多因子評分",
+            "action": score_action,
+            "reason": f"綜合分數 {score:.2f}，由動能、20/50日均線位置和策略訊號組成。",
+        }
+    )
+
+    risk_action = "HOLD" if analysis["signal"] == "BUY" and score < 25 else analysis["signal"]
+    judgements.append(
+        {
+            "theory": "風險控制",
+            "action": risk_action,
+            "reason": f"單筆訂單仍受 ${MAX_ORDER_NOTIONAL:,.0f} 風控上限限制；訊號不足強時不追價。",
+        }
+    )
+    return judgements
+
+
+def aggregate_theory_action(judgements: list[dict[str, str]]) -> str:
+    weights = {"BUY": 1, "HOLD": 0, "SELL": -1}
+    total = sum(weights.get(item["action"], 0) for item in judgements)
+    if total >= 2:
+        return "BUY"
+    if total <= -2:
+        return "SELL"
+    return "HOLD"
+
+
+def local_stock_answer(symbol: str, question: str, analysis: dict, judgements: list[dict[str, str]]) -> str:
+    final_action = aggregate_theory_action(judgements)
+    theory_lines = "\n".join(
+        f"- {item['theory']}: {item['action']}。{item['reason']}" for item in judgements
+    )
+    return (
+        f"{symbol} 本地多理論分析結論：{final_action}\n\n"
+        f"你的問題：{question or '是否應該買入或賣出？'}\n\n"
+        f"行情摘要：最新價 ${analysis['latest']:,.2f}，20日均線 ${analysis['short_ma']:,.2f}，"
+        f"50日均線 ${analysis['long_ma']:,.2f}，5日動能 {analysis['momentum']:.2f}%，"
+        f"系統分數 {analysis['score']:.2f}。\n\n"
+        f"不同理論判斷：\n{theory_lines}\n\n"
+        "執行建議：即使結論是 BUY 或 SELL，系統也只會生成待確認訂單；你仍需在訂單區手動確認。"
+    )
+
+
+def call_openai_llm(symbol: str, question: str, analysis: dict, judgements: list[dict[str, str]]) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured.")
+    prompt = {
+        "symbol": symbol,
+        "question": question,
+        "market_analysis": analysis,
+        "theory_judgements": judgements,
+        "required_output": "用繁體中文回答，明確給出 BUY/HOLD/SELL，解釋不同理論分歧和風險，不可承諾收益。",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是股票量化分析助手。只根據提供的行情和理論判斷回答，不要編造未提供的財報或新聞。回答不是財務建議。",
+            },
+            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+        ],
+        "temperature": 0.2,
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    return result["choices"][0]["message"]["content"]
+
+
+def ask_stock_assistant(symbol: str, question: str) -> str:
+    clean = normalize_symbol(symbol) or "AAPL"
+    market = fetch_market_data(clean)
+    analysis = analyze_market(market, load_account())
+    judgements = build_theory_judgements(analysis)
+    provider = "local"
+    try:
+        answer = call_openai_llm(clean, question, analysis, judgements)
+        provider = f"openai:{OPENAI_MODEL}"
+    except Exception as exc:
+        answer = local_stock_answer(clean, question, analysis, judgements)
+        if OPENAI_API_KEY:
+            answer += f"\n\nLLM API 暫時不可用，已改用本地分析。錯誤：{exc}"
+
+    state = {
+        "symbol": clean,
+        "question": question,
+        "answer": answer,
+        "provider": provider,
+        "analysis": analysis,
+        "judgements": judgements,
+        "created_at": now_iso(),
+    }
+    write_json(LLM_STATE_PATH, state)
+    write_json(SCAN_STATE_PATH, {"market": asdict(market), "analysis": analysis})
+    return f"已完成 {clean} 股票分析。"
+
+
+def load_llm_state() -> dict:
+    return read_json(
+        LLM_STATE_PATH,
+        {
+            "symbol": "",
+            "question": "",
+            "answer": "尚未提問。輸入股票和問題後，系統會用趨勢跟隨、動量、均值回歸、多因子和風控框架判斷。",
+            "provider": "local",
+            "analysis": {},
+            "judgements": [],
+            "created_at": "",
+        },
+    )
+
+
 def auto_scan_watchlist(watchlist: str) -> str:
     symbols = [normalize_symbol(item) for item in watchlist.split(",") if normalize_symbol(item)]
     if not symbols:
@@ -625,6 +789,23 @@ def render_recommendations(recommendations: list[dict]) -> str:
     return "".join(rows) or "<tr><td colspan='9'>暫無推薦</td></tr>"
 
 
+def render_theory_rows(judgements: list[dict[str, str]]) -> str:
+    rows = []
+    for item in judgements:
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(item['theory'])}</td>"
+            f"<td><span class='status'>{html.escape(item['action'])}</span></td>"
+            f"<td>{html.escape(item['reason'])}</td>"
+            "</tr>"
+        )
+    return "".join(rows) or "<tr><td colspan='3'>尚未分析</td></tr>"
+
+
+def format_multiline_text(value: str) -> str:
+    return "<br>".join(html.escape(value).splitlines())
+
+
 def render_page(message: str = "") -> bytes:
     account = load_account()
     orders = load_orders()
@@ -632,6 +813,7 @@ def render_page(message: str = "") -> bytes:
     auto_state = load_auto_state()
     watchlist = load_watchlist()
     recommendations = load_recommendations()
+    llm_state = load_llm_state()
     analysis = scan["analysis"]
     market = scan["market"]
     news = fetch_news()
@@ -683,6 +865,7 @@ def render_page(message: str = "") -> bytes:
         .warn {{ color: #9a3412; background: #fff7ed; padding: 8px; border-radius: 6px; }}
         .status {{ font-weight: 700; }}
         .wide {{ grid-column: 1 / -1; }}
+        .answer {{ white-space: normal; line-height: 1.5; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; }}
         small {{ display: block; color: #64748b; margin-top: 4px; }}
         svg {{ width: 100%; height: 170px; background: #fbfdff; border: 1px solid #e2e8f0; border-radius: 8px; }}
         ul {{ padding-left: 18px; }}
@@ -721,6 +904,19 @@ def render_page(message: str = "") -> bytes:
           <table>
             <thead><tr><th>股票</th><th>方向</th><th>數量</th><th>價格</th><th>金額</th><th>狀態</th><th>原因</th><th>操作</th></tr></thead>
             <tbody>{render_orders(orders)}</tbody>
+          </table>
+
+          <h2>LLM 股票分析助手</h2>
+          <form method="post" action="/llm-ask">
+            <input name="symbol" value="{html.escape(llm_state.get('symbol') or analysis['symbol'])}" placeholder="股票代碼">
+            <input name="question" value="{html.escape(llm_state.get('question') or '這隻股票現在應該買入還是賣出？')}" placeholder="輸入你的問題">
+            <button>分析股票</button>
+          </form>
+          <small>Provider：{html.escape(llm_state.get('provider', 'local'))} | 時間：{html.escape(llm_state.get('created_at', '') or '-')}</small>
+          <div class="answer">{format_multiline_text(llm_state.get('answer', ''))}</div>
+          <table>
+            <thead><tr><th>理論</th><th>判斷</th><th>原因</th></tr></thead>
+            <tbody>{render_theory_rows(llm_state.get('judgements', []))}</tbody>
           </table>
         </section>
 
@@ -801,6 +997,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/recommend-refresh":
             refresh_recommendations()
             self.respond(render_page("推薦排行已刷新。"))
+            return
+        if self.path == "/llm-ask":
+            symbol = data.get("symbol", ["AAPL"])[0]
+            question = data.get("question", ["這隻股票現在應該買入還是賣出？"])[0]
+            self.respond(render_page(ask_stock_assistant(symbol, question)))
             return
         if self.path == "/auto-start":
             watchlist = data.get("watchlist", [",".join(load_watchlist())])[0]
